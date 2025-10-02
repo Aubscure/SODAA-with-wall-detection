@@ -451,6 +451,13 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             if (emptyDetectionsStreak >= REQUIRED_EMPTY_STREAK) {
                 // Run wall detection first to get current state
                 updateWallDetection(emptyList())
+                
+                // Generate path clear guidance when no objects are detected
+                val pathClearGuidance = generatePathClearGuidance()
+                if (pathClearGuidance != null && pathClearGuidance != lastSpokenGuidance) {
+                    lastSpokenGuidance = pathClearGuidance
+                    speakGuidance(pathClearGuidance, "path_clear")
+                }
             }
         }
     }
@@ -747,6 +754,25 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     // Debounce for empty detections to avoid saying "Path clear" between detection frames
     private var emptyDetectionsStreak = 0
     private val REQUIRED_EMPTY_STREAK = 2 // Reduced for faster response
+
+    private fun generatePathClearGuidance(): String? {
+        val depth = depthMap ?: return null
+        
+        // Check if there's a close wall that would block the path
+        val wallClose = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD
+        if (wallClose) {
+            // Don't announce path clear if there's a close wall
+            return null
+        }
+        
+        // Check if the forward corridor is clear
+        val corridorClear = isForwardCorridorClear(depth)
+        if (corridorClear) {
+            return "Path clear, proceed forward"
+        }
+        
+        return null
+    }
 
     // Depth-based forward corridor check (bottom-center region clear and reasonably far)
     private fun isForwardCorridorClear(depth: Array<FloatArray>): Boolean {
