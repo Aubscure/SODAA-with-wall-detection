@@ -697,7 +697,13 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             val centerPathClear = isCenterPathClear()
             // Also check for close walls
             val wallClose = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD
-            return if (centerPathClear && !wallClose) {
+            Log.d("NAV_DEBUG", "Wall close check: wallDetected=$wallDetected, lastWallMeters=$lastWallMeters, threshold=$WALL_WARNING_DISTANCE_THRESHOLD, wallClose=$wallClose")
+            // CRITICAL: Check for darkness - never suggest proceeding in dark conditions
+            val tooDark = lastBrightness < DARKNESS_BRIGHTNESS_THRESHOLD
+            
+            Log.d("NAV_DEBUG", "Center path guidance: centerClear=$centerPathClear, wallClose=$wallClose, tooDark=$tooDark, brightness=$lastBrightness")
+            
+            return if (centerPathClear && !wallClose && !tooDark) {
                 "Objects on both sides $distanceDescription ahead, center path is clear, proceed forward"
             } else if (wallClose) {
                 val wallDistancePart = if (lastWallMeters != null) String.format("%.1f meters", lastWallMeters) else ""
@@ -706,6 +712,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 } else {
                     "Wall ahead, be careful, feel what's in front of you and stop"
                 }
+            } else if (tooDark) {
+                "Too dark to navigate safely, please stop"
             } else {
                 "Objects on both sides $distanceDescription ahead, proceed carefully forward"
             }
@@ -783,19 +791,36 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private fun generatePathClearGuidance(): String? {
         val depth = depthMap ?: return null
         
-        // Check if there's a close wall that would block the path
-        val wallClose = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD
-        if (wallClose) {
-            // Don't announce path clear if there's a close wall
+        // CRITICAL: Never announce path clear if it's too dark to navigate safely
+        if (lastBrightness < DARKNESS_BRIGHTNESS_THRESHOLD) {
+            Log.d("PATH_CLEAR_DEBUG", "Path clear BLOCKED: Too dark (brightness=${lastBrightness} < ${DARKNESS_BRIGHTNESS_THRESHOLD})")
             return null
         }
         
-        // Check if the forward corridor is clear
+        // SIMPLIFIED LOGIC: Wall detection takes absolute priority
+        if (wallDetected) {
+            Log.d("PATH_CLEAR_DEBUG", "Wall detected - lastWallMeters=$lastWallMeters, threshold=$WALL_WARNING_DISTANCE_THRESHOLD")
+            if (lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD) {
+                // Close wall detected - never announce path clear
+                Log.d("PATH_CLEAR_DEBUG", "Path clear BLOCKED: Close wall at ${lastWallMeters}m (< ${WALL_WARNING_DISTANCE_THRESHOLD}m)")
+                return null
+            } else {
+                // Far wall detected - path might be clear
+                Log.d("PATH_CLEAR_DEBUG", "Path clear APPROVED: Far wall at ${lastWallMeters}m (>= ${WALL_WARNING_DISTANCE_THRESHOLD}m)")
+                return "Path clear, proceed forward"
+            }
+        }
+        
+        // No wall detected - check depth sampling for other obstacles
         val corridorClear = isForwardCorridorClear(depth)
+        Log.d("PATH_CLEAR_DEBUG", "No wall detected, corridor sampling: $corridorClear")
+        
         if (corridorClear) {
+            Log.d("PATH_CLEAR_DEBUG", "Path clear APPROVED: No obstacles detected")
             return "Path clear, proceed forward"
         }
         
+        Log.d("PATH_CLEAR_DEBUG", "Path clear BLOCKED: Obstacles detected in corridor")
         return null
     }
 
@@ -874,11 +899,17 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
 
     // Depth-based forward corridor check (bottom-center region clear and reasonably far)
     private fun isForwardCorridorClear(depth: Array<FloatArray>): Boolean {
-        // If a wall is detected but it's far away (beyond warning threshold), consider corridor clear
-        if (wallDetected && lastWallMeters != null && lastWallMeters!! >= WALL_WARNING_DISTANCE_THRESHOLD) {
-            return true // Wall is far, corridor is clear
+        // CRITICAL FIX: If any wall is detected, defer to wall detection logic completely
+        // Don't try to override wall detection with separate depth sampling
+        if (wallDetected) {
+            // If wall is far (>= 1.5m), corridor might be clear
+            // If wall is close (< 1.5m), corridor is NOT clear
+            val wallFar = lastWallMeters != null && lastWallMeters!! >= WALL_WARNING_DISTANCE_THRESHOLD
+            Log.d("PATH_CLEAR_DEBUG", "Wall detected, deferring to wall logic: wallFar=$wallFar, distance=$lastWallMeters")
+            return wallFar
         }
         
+        // Only use depth sampling when NO wall is detected
         // Sample a rectangle in the lower middle of the frame
         val xStartN = 0.33f
         val xEndN = 0.66f
@@ -911,7 +942,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
         if (samples == 0) return false
         // Consider corridor clear if the closest sample is at least 1.2 m away
-        return minMeters >= 1.2f
+        val result = minMeters >= 1.2f
+        Log.d("PATH_CLEAR_DEBUG", "No wall detected, depth sampling result: minDistance=${minMeters}m, clear=$result")
+        return result
     }
 
     private fun updateHud() {
