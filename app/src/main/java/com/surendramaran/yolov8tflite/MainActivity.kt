@@ -87,14 +87,14 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private val GRID_ROWS = 3
     private val GRID_COLS = 3
     // Distance filtering for wall detection
-    private val WALL_MIN_DISTANCE_METERS = 0.8f  // Ignore surfaces closer than 0.8m (likely floor)
-    private val WALL_MAX_DISTANCE_METERS = 3.0f  // Ignore surfaces farther than 3.0m (likely background)
-    private val WALL_FLOOR_EXCLUDE_HEIGHT = 0.7f // Exclude bottom 30% of frame (likely floor)
-    private val WALL_MIN_SCORE_THRESHOLD = 1.2f  // Lower threshold for more sensitive wall detection
+    private val WALL_MIN_DISTANCE_METERS = 0.3f  // Allow closer walls (was 0.8f)
+    private val WALL_MAX_DISTANCE_METERS = 4.0f  // Allow farther walls (was 3.0f)
+    private val WALL_FLOOR_EXCLUDE_HEIGHT = 0.8f // Exclude bottom 20% of frame (was 30%)
+    private val WALL_MIN_SCORE_THRESHOLD = 0.8f  // Lower threshold for more sensitive detection (was 1.2f)
     // Wall detection improvements
-    private val WALL_OPTIMAL_DISTANCE_MIN = 1.0f // Prefer walls at reasonable distances (not too close)
-    private val WALL_OPTIMAL_DISTANCE_MAX = 2.0f // Not too far either
-    private val WALL_WARNING_DISTANCE_THRESHOLD = 1.5f // Only warn about walls within 1 meter
+    private val WALL_OPTIMAL_DISTANCE_MIN = 0.5f // Allow closer optimal range (was 1.0f)
+    private val WALL_OPTIMAL_DISTANCE_MAX = 3.0f // Extend optimal range (was 2.0f)
+    private val WALL_WARNING_DISTANCE_THRESHOLD = 1.5f // Only warn about walls within 1.5 meters
     private var wallDetected: Boolean = false
     private var lastWallVar: Float = 0f
     private var lastWallAspect: Float = 0f
@@ -123,7 +123,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private var frameTimestampMs: Long = 0L
     private var depthSourceTimestampMs: Long = 0L
     private var lastDetectionFrameTimestampMs: Long = 0L
-    private var lastDetectionsTimestampMs: Long = 0L
 
     
 
@@ -485,8 +484,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             }
 
             if (filteredBoxes.isNotEmpty()) {
-                // Mark that we saw obstacles/detections recently
-                lastDetectionsTimestampMs = System.currentTimeMillis()
                 val regionAnalysis = analyzeRegions(filteredBoxes)
                 val guidance = generateNavigationGuidance(
                     regionAnalysis.leftOccupied,
@@ -532,8 +529,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                     moved
                 }
 
-                // Only speak if guidance is not null, not "Path clear", different, and object is new/moved
-                if (guidance != null && guidance != "Path clear, move forward" && guidance != lastSpokenGuidance && shouldSpeak) {
+                // Only speak if guidance is not null, different, and object is new/moved
+                if (guidance != null && guidance != lastSpokenGuidance && shouldSpeak) {
                     lastSpokenGuidance = guidance
                     val primaryObjectId = filteredBoxes.firstOrNull()?.clsName ?: "general"
                     speakGuidance(guidance, primaryObjectId)
@@ -681,16 +678,11 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 "Objects on both sides $distanceDescription ahead, proceed carefully forward"
             }
         } else if (!leftOccupied && !centerOccupied && !rightOccupied && !aboveOccupied && !belowOccupied) {
-            // Double-check with depth data that center path is actually clear
-            val centerPathClear = isCenterPathClear()
-            return if (centerPathClear) {
-                null // Let updateGuidanceAfterWallDetection() handle "Path clear"
-            } else {
-                "Path appears clear but be cautious"
-            }
+            // No objects detected in any region
+            return null
         } else {
             // Default case when no specific guidance applies
-            // Check for close walls before saying path clear
+            // Check for close walls before giving any guidance
             val wallClose = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD
             if (wallClose) {
                 val distancePart = if (lastWallMeters != null) String.format("%.1f meters", lastWallMeters) else ""
@@ -701,13 +693,8 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 }
             }
             
-            val openSide = when {
-                !leftOccupied && !rightOccupied -> "forward"
-                !leftOccupied -> "left"
-                !rightOccupied -> "right"
-                else -> "carefully forward"
-            }
-            return "Path clear, move $openSide"
+            // No specific guidance needed
+            return null
         }
     }
 
@@ -874,6 +861,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         // Scan grid (and vertical bands inside each cell to allow tall regions)
         var bestRegion: RectF? = null
         var bestScore = Float.NEGATIVE_INFINITY
+        val candidateRegions = mutableListOf<Pair<RectF, Float>>() // Store all good candidates
 
         for (r in 0 until GRID_ROWS) {
             for (c in 0 until GRID_COLS) {
@@ -948,7 +936,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                     val distanceScore = if (avgDepthMeters != null) {
                         when {
                             avgDepthMeters in WALL_OPTIMAL_DISTANCE_MIN..WALL_OPTIMAL_DISTANCE_MAX -> 1.0f // Optimal range
-                            avgDepthMeters < WALL_OPTIMAL_DISTANCE_MIN -> 0.3f // Too close (likely free space)
+                            avgDepthMeters < WALL_OPTIMAL_DISTANCE_MIN -> 0.7f // Close walls are still valid (was 0.3f)
                             avgDepthMeters > WALL_OPTIMAL_DISTANCE_MAX -> 0.5f // Too far (likely background)
                             else -> 0.0f
                         }
@@ -976,12 +964,19 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                         lastWallAspect = aspect
                         lastWallMean = mean
                     }
+                    
+                    // Store all good candidates for potential merging
+                    if (score >= WALL_MIN_SCORE_THRESHOLD) {
+                        candidateRegions.add(Pair(candidateRect, score))
+                    }
                 }
             }
         }
 
-        // Only consider it a wall if the score is high enough
-        val finalWallRegion = if (bestRegion != null && bestScore >= WALL_MIN_SCORE_THRESHOLD) bestRegion else null
+        // Try to merge adjacent wall regions for a more accurate representation
+        val finalWallRegion = if (bestRegion != null && bestScore >= WALL_MIN_SCORE_THRESHOLD) {
+            mergeAdjacentWallRegions(candidateRegions, bestRegion)
+        } else null
         
         lastWallRegion = finalWallRegion
         binding.overlay.setWallRegion(finalWallRegion)
@@ -1025,9 +1020,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             "WALL no"
         }
         binding.overlay.setWallDebugText(debugText)
-
-        // Add this line:
-        updateGuidanceAfterWallDetection()
     }
 
     private fun intersectionOverUnion(a: RectF, b: RectF): Float {
@@ -1153,46 +1145,47 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         return Pair(smoothedWallDetected, smoothedDistance)
     }
 
-    private fun updateGuidanceAfterWallDetection() {
-        val now = System.currentTimeMillis()
-        val wallClose = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD
-        val wallFar = wallDetected && lastWallMeters != null && lastWallMeters!! >= WALL_WARNING_DISTANCE_THRESHOLD
-
-        val recentWallWarning = (now - lastWallSpokenTime) < WALL_SPEECH_COOLDOWN_MS
-        // Consider detections "recent" for a short window to avoid saying Path clear right after objects were seen
-        val recentDetections = (now - lastDetectionsTimestampMs) < 800L || emptyDetectionsStreak < REQUIRED_EMPTY_STREAK
-        // Avoid overriding other queued or ongoing speech with a Path clear message
-        val pathClearShouldSpeak = !isSpeaking && speechQueue.isEmpty()
-
-        when {
-            wallClose && !recentWallWarning -> {
-                val distancePart = if (lastWallMeters != null) String.format("%.1f meters", lastWallMeters) else ""
-                val msg = if (distancePart.isNotEmpty()) {
-                    "Wall ahead $distancePart, be careful, feel what's in front of you and stop"
-                } else {
-                    "Wall ahead, be careful, feel what's in front of you and stop"
-                }
-                if (lastSpokenGuidance != msg) {
-                    lastSpokenGuidance = msg
-                    speakGuidance(msg, "wall")
-                }
-            }
-            // Only announce Path clear when there haven't been recent detections and we won't override other prompts
-            wallFar && !recentDetections && pathClearShouldSpeak -> {
-                // Wall is far, treat as path clear
-                if (lastSpokenGuidance != "Path clear, move forward") {
-                    lastSpokenGuidance = "Path clear, move forward"
-                    speakGuidance(lastSpokenGuidance!!)
-                }
-            }
-            !wallDetected && !recentDetections && pathClearShouldSpeak -> {
-                // No wall at all, treat as path clear
-                if (lastSpokenGuidance != "Path clear, move forward") {
-                    lastSpokenGuidance = "Path clear, move forward"
-                    speakGuidance(lastSpokenGuidance!!)
-                }
+    private fun mergeAdjacentWallRegions(candidates: List<Pair<RectF, Float>>, bestRegion: RectF): RectF {
+        if (candidates.size <= 1) return bestRegion
+        
+        // Find candidates that are adjacent to the best region (lightweight check)
+        val adjacentThreshold = 0.15f // 15% overlap or adjacency
+        val mergeableRegions = mutableListOf<RectF>()
+        mergeableRegions.add(bestRegion)
+        
+        for ((candidate, score) in candidates) {
+            if (candidate == bestRegion) continue
+            
+            // Check if regions are adjacent or overlapping
+            val horizontalOverlap = !(candidate.right < bestRegion.left - adjacentThreshold || 
+                                    candidate.left > bestRegion.right + adjacentThreshold)
+            val verticalOverlap = !(candidate.bottom < bestRegion.top - adjacentThreshold || 
+                                  candidate.top > bestRegion.bottom + adjacentThreshold)
+            
+            if (horizontalOverlap && verticalOverlap && score >= WALL_MIN_SCORE_THRESHOLD * 0.8f) {
+                mergeableRegions.add(candidate)
             }
         }
+        
+        // If we found adjacent regions, create a bounding box around all of them
+        if (mergeableRegions.size > 1) {
+            var minLeft = Float.MAX_VALUE
+            var minTop = Float.MAX_VALUE
+            var maxRight = -Float.MAX_VALUE
+            var maxBottom = -Float.MAX_VALUE
+            
+            for (region in mergeableRegions) {
+                minLeft = min(minLeft, region.left)
+                minTop = min(minTop, region.top)
+                maxRight = max(maxRight, region.right)
+                maxBottom = max(maxBottom, region.bottom)
+            }
+            
+            return RectF(minLeft, minTop, maxRight, maxBottom)
+        }
+        
+        return bestRegion
     }
+
 }
 
