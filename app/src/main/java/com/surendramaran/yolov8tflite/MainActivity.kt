@@ -108,6 +108,19 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private val WALL_STATE_HISTORY_SIZE = 3 // Number of frames to consider for smoothing (reduced for responsiveness)
     private val WALL_DISTANCE_HISTORY_SIZE = 1 // Number of distance measurements to average (reduced for responsiveness)
 
+    // System failure detection
+    private var systemFailureCounter = 0
+    private var lastSystemFailureWarning = 0L
+    private val SYSTEM_FAILURE_THRESHOLD = 30 // frames (about 10 seconds at 3fps)
+    private val SYSTEM_FAILURE_WARNING_COOLDOWN_MS = 10000L // 10 seconds
+
+    // Darkness detection
+    private var darknessCounter = 0
+    private var lastDarknessWarning = 0L
+    private val DARKNESS_THRESHOLD = 5 // frames before warning
+    private val DARKNESS_WARNING_COOLDOWN_MS = 5000L // 5 seconds
+    private val DARKNESS_BRIGHTNESS_THRESHOLD = 30.0f // Average brightness below this triggers warning (0-255 scale)
+
     private var frameStep = 0;
     private val totalPipelineSteps = 3;
 
@@ -123,6 +136,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private var frameTimestampMs: Long = 0L
     private var depthSourceTimestampMs: Long = 0L
     private var lastDetectionFrameTimestampMs: Long = 0L
+    private var lastBrightness: Float = 0f
 
     
 
@@ -306,6 +320,10 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                         lastDetectionFrameTimestampMs = frameTimestampMs
                         detector?.detect(rotatedBitmap, screenWidth, screenHeight);
                     }
+                    // Also check darkness on every frame for safety
+                    runOnUiThread {
+                        checkDarkness(rotatedBitmap)
+                    }
                 }
                 1 -> {
                     if (depthFrameCounter % DEPTH_SKIP_INTERVAL == 0) {
@@ -324,6 +342,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                                     binding.overlay.setDepthMap(raw)
                                     depthMap = raw
                                     depthSourceTimestampMs = sourceTs
+                                    systemFailureCounter = 0 // Reset system failure counter on successful depth update
                                     // Wall detection is now called directly in navigation functions for real-time updates
                                 }
                                 updateHud()
@@ -448,8 +467,13 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         runOnUiThread {
             binding.overlay.clear()
             emptyDetectionsStreak++
+            
+            // Check for system failure (both detector and depth not working)
+            checkSystemFailure()
+            
             if (emptyDetectionsStreak >= REQUIRED_EMPTY_STREAK) {
                 // Run wall detection first to get current state
+                // (updateWallDetection now calls updateHud() internally for sync)
                 updateWallDetection(emptyList())
                 
                 // Generate path clear guidance when no objects are detected
@@ -481,8 +505,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         runOnUiThread {
             // Reset empty-frame streak when we have detections
             emptyDetectionsStreak = 0
+            systemFailureCounter = 0 // Reset system failure counter on successful detection
             lastDetectionInferenceTime = inferenceTime
-            updateHud()
+            // HUD will be updated after wall detection for proper sync
             // Filter boxes by distance (0.5m to 5.0m)
             val filteredBoxes = boundingBoxes
             binding.overlay.apply {
@@ -774,6 +799,79 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         return null
     }
 
+    private fun checkSystemFailure() {
+        // Check if both detector and depth estimation are failing
+        val depthAge = if (depthSourceTimestampMs > 0L) System.currentTimeMillis() - depthSourceTimestampMs else -1L
+        val depthFailing = depthMap == null || depthAge > 5000L // Depth data older than 5 seconds
+        val detectorFailing = emptyDetectionsStreak > 10 // No detections for extended period
+        
+        if (depthFailing && detectorFailing) {
+            systemFailureCounter++
+            
+            // Warn user if system has been failing for too long
+            val now = System.currentTimeMillis()
+            if (systemFailureCounter >= SYSTEM_FAILURE_THRESHOLD && now - lastSystemFailureWarning > SYSTEM_FAILURE_WARNING_COOLDOWN_MS) {
+                val warningMsg = "Warning: Navigation system may not be working properly. Please be extra careful and consider stopping."
+                speakGuidance(warningMsg, "system_failure")
+                lastSystemFailureWarning = now
+                Log.w("SYSTEM_FAILURE", "System failure detected: depth failing=$depthFailing, detector failing=$detectorFailing, counter=$systemFailureCounter")
+            }
+        } else {
+            // Reset counter if either system is working
+            if (systemFailureCounter > 0) {
+                systemFailureCounter = max(0, systemFailureCounter - 2) // Slow recovery
+            }
+        }
+    }
+
+    private fun checkDarkness(bitmap: Bitmap) {
+        val brightness = calculateAverageBrightness(bitmap)
+        lastBrightness = brightness // Store for HUD display
+        
+        if (brightness < DARKNESS_BRIGHTNESS_THRESHOLD) {
+            darknessCounter++
+            
+            // Warn user if it's been dark for too many frames
+            val now = System.currentTimeMillis()
+            if (darknessCounter >= DARKNESS_THRESHOLD && now - lastDarknessWarning > DARKNESS_WARNING_COOLDOWN_MS) {
+                val warningMsg = "Warning: Environment is too dark for safe navigation. Please stop and find better lighting or assistance."
+                speakGuidance(warningMsg, "darkness")
+                lastDarknessWarning = now
+                Log.w("DARKNESS_WARNING", "Dark environment detected: brightness=$brightness, threshold=$DARKNESS_BRIGHTNESS_THRESHOLD")
+            }
+        } else {
+            // Reset counter when brightness is adequate
+            darknessCounter = 0
+        }
+    }
+
+    private fun calculateAverageBrightness(bitmap: Bitmap): Float {
+        val width = bitmap.width
+        val height = bitmap.height
+        var totalBrightness = 0L
+        var pixelCount = 0
+        
+        // Sample every 4th pixel for performance (still gives accurate average)
+        val step = 4
+        for (y in 0 until height step step) {
+            for (x in 0 until width step step) {
+                val pixel = bitmap.getPixel(x, y)
+                
+                // Calculate luminance using standard weights
+                val red = (pixel shr 16) and 0xFF
+                val green = (pixel shr 8) and 0xFF
+                val blue = pixel and 0xFF
+                
+                // Standard luminance formula: 0.299*R + 0.587*G + 0.114*B
+                val brightness = (0.299 * red + 0.587 * green + 0.114 * blue).toInt()
+                totalBrightness += brightness
+                pixelCount++
+            }
+        }
+        
+        return if (pixelCount > 0) totalBrightness.toFloat() / pixelCount else 0f
+    }
+
     // Depth-based forward corridor check (bottom-center region clear and reasonably far)
     private fun isForwardCorridorClear(depth: Array<FloatArray>): Boolean {
         // If a wall is detected but it's far away (beyond warning threshold), consider corridor clear
@@ -846,7 +944,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         binding.inferenceTime.setTextColor(color)
         val ageText = if (depthAgeMs >= 0) "\nDepthAge: ${depthAgeMs}ms (${ageLabel})" else ""
         binding.inferenceTime.isSingleLine = false
-        binding.inferenceTime.maxLines = 4
+        binding.inferenceTime.maxLines = 6
         binding.inferenceTime.textAlignment = View.TEXT_ALIGNMENT_VIEW_START
         val wallMetersText = lastWallMeters?.let { String.format("%.1f m", it) } ?: "n/a"
         val wallText = if (wallDetected) {
@@ -858,7 +956,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         } else {
             "WALL no"
         }
-        binding.inferenceTime.text = "Det: ${det}ms (${detLabel})\nDepth: ${dep}ms (${depLabel})\nLag: ${lag}ms (${lagLabel})${ageText}\n" + wallText
+        val brightnessStatus = if (lastBrightness < DARKNESS_BRIGHTNESS_THRESHOLD) "DARK" else "OK"
+        val brightnessText = "\nBrightness: ${String.format("%.1f", lastBrightness)} ($brightnessStatus)"
+        binding.inferenceTime.text = "Det: ${det}ms (${detLabel})\nDepth: ${dep}ms (${depLabel})\nLag: ${lag}ms (${lagLabel})${ageText}\n" + wallText + brightnessText
     }
 
     // -------------------- WALL DETECTION --------------------
@@ -1012,10 +1112,15 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         val currentDistance = if (finalWallRegion != null) approximateRegionDistanceMeters(finalWallRegion, depth) else null
         val (smoothedWallDetected, smoothedDistance) = smoothWallDetection(currentWallDetected, currentDistance)
         
+        // Update debug state and logs FIRST to ensure consistency
+        wallDetected = smoothedWallDetected
+        lastWallScore = bestScore
+        lastWallMeters = smoothedDistance
+        
         // TTS if a smoothed wall is detected AND it's close enough to warn about
         val now = System.currentTimeMillis()
-        if (smoothedWallDetected && smoothedDistance != null && smoothedDistance < WALL_WARNING_DISTANCE_THRESHOLD && now - lastWallSpokenTime > WALL_SPEECH_COOLDOWN_MS) {
-            val distancePart = if (smoothedDistance in 0.5f..5.0f) String.format("%.1f meters", smoothedDistance) else ""
+        if (wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD && now - lastWallSpokenTime > WALL_SPEECH_COOLDOWN_MS) {
+            val distancePart = if (lastWallMeters!! in 0.5f..5.0f) String.format("%.1f meters", lastWallMeters!!) else ""
             val msg = if (distancePart.isNotEmpty()) {
                 "Wall ahead $distancePart, be careful, feel what's in front of you and stop"
             } else {
@@ -1024,11 +1129,6 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             speakGuidance(msg, "wall")
             lastWallSpokenTime = now
         }
-        
-        // Update debug state and logs
-        wallDetected = smoothedWallDetected
-        lastWallScore = bestScore
-        lastWallMeters = smoothedDistance
         val consensusCount = wallStateHistory.count { it }
         Log.d("WALL_DEBUG", "raw=$currentWallDetected smoothed=$wallDetected history=${wallStateHistory} consensus=${consensusCount}/3 score=${String.format("%.3f", bestScore)} var=${String.format("%.5f", lastWallVar)} asp=${String.format("%.2f", lastWallAspect)} mean=${String.format("%.3f", lastWallMean)} meters=${lastWallMeters ?: -1f}")
 
@@ -1046,6 +1146,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             "WALL no"
         }
         binding.overlay.setWallDebugText(debugText)
+        
+        // Update HUD immediately to sync with wall detection state
+        updateHud()
     }
 
     private fun intersectionOverUnion(a: RectF, b: RectF): Float {
