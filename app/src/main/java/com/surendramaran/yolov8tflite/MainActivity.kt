@@ -180,7 +180,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                             lastSpokenTime = System.currentTimeMillis()
                             runOnUiThread {
                                 speechQueue.removeFirstOrNull()?.let { next ->
-                                    speakGuidance(next)
+                                    speakGuidance(next) // Queue items are normal priority by default
                                 }
                             }
                         }
@@ -394,15 +394,46 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         }
     }
 
-    private fun speakGuidance(guidance: String, objectId: String? = null) {
+    private fun speakGuidance(guidance: String, objectId: String? = null, priority: Int = 0) {
         val now = System.currentTimeMillis()
-        // Per-object cooldown
-        if (objectId != null) {
+        
+        // High priority alerts (like darkness) can interrupt other speech
+        val isHighPriority = priority > 0
+        
+        // Per-object cooldown (but not for high priority alerts)
+        if (objectId != null && !isHighPriority) {
             val lastObjectSpoken = spokenObjectTimestamps[objectId] ?: 0
             if (now - lastObjectSpoken < OBJECT_ALERT_COOLDOWN_MS) return
             spokenObjectTimestamps[objectId] = now
         }
-        // Global cooldown and queue
+        
+        // High priority alerts for critical safety warnings (darkness, system failure)
+        if (isHighPriority) {
+            if (!ttsReady) {
+                // TTS not ready, queue the guidance at front
+                speechQueue.removeAll { it == guidance } // Remove any existing instance
+                speechQueue.addFirst(guidance)
+                return
+            }
+            
+            // Interrupt current speech for high priority alerts
+            if (isSpeaking) {
+                tts.stop() // Stop current speech
+                isSpeaking = false
+            }
+            
+            // Update timestamp for this specific object
+            if (objectId != null) {
+                spokenObjectTimestamps[objectId] = now
+            }
+            
+            isSpeaking = true
+            lastSpokenTime = now
+            tts.speak(guidance, TextToSpeech.QUEUE_FLUSH, null, "GUIDANCE_HIGH_PRIORITY")
+            return
+        }
+        
+        // Normal priority alerts (objects, walls, path clear)
         if (!ttsReady) {
             // TTS not ready, queue the guidance
             if (!speechQueue.contains(guidance)) {
@@ -410,12 +441,14 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             }
             return
         }
+        
         if (isSpeaking || now - lastSpokenTime < SPEECH_COOLDOWN_MS) {
             if (!speechQueue.contains(guidance)) {
                 speechQueue.addLast(guidance)
             }
             return
         }
+        
         isSpeaking = true
         lastSpokenTime = now
         tts.speak(guidance, TextToSpeech.QUEUE_FLUSH, null, "GUIDANCE")
@@ -476,11 +509,26 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
                 // (updateWallDetection now calls updateHud() internally for sync)
                 updateWallDetection(emptyList())
                 
-                // Generate path clear guidance when no objects are detected
+                // CRITICAL: Check for darkness first - highest priority
+                if (lastBrightness < DARKNESS_BRIGHTNESS_THRESHOLD) {
+                    // Don't announce path clear in dark conditions
+                    Log.d("PATH_CLEAR_DEBUG", "Skipping path clear guidance - too dark (brightness=${lastBrightness})")
+                    return@runOnUiThread
+                }
+                
+                // CRITICAL: Check for close walls - second highest priority
+                if (wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD) {
+                    // Don't announce path clear when wall is close - wall warning should have priority
+                    Log.d("PATH_CLEAR_DEBUG", "Skipping path clear guidance - close wall detected at ${lastWallMeters}m")
+                    return@runOnUiThread
+                }
+                
+                // Generate path clear guidance only when safe conditions are met
                 val pathClearGuidance = generatePathClearGuidance()
                 if (pathClearGuidance != null && pathClearGuidance != lastSpokenGuidance) {
                     lastSpokenGuidance = pathClearGuidance
                     speakGuidance(pathClearGuidance, "path_clear")
+                    Log.d("PATH_CLEAR_DEBUG", "Announcing path clear guidance: $pathClearGuidance")
                 }
             }
         }
@@ -791,6 +839,9 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
     private fun generatePathClearGuidance(): String? {
         val depth = depthMap ?: return null
         
+        Log.d("PATH_CLEAR_DEBUG", "=== generatePathClearGuidance() ENTRY ===")
+        Log.d("PATH_CLEAR_DEBUG", "wallDetected=$wallDetected, lastWallMeters=$lastWallMeters, brightness=$lastBrightness")
+        
         // CRITICAL: Never announce path clear if it's too dark to navigate safely
         if (lastBrightness < DARKNESS_BRIGHTNESS_THRESHOLD) {
             Log.d("PATH_CLEAR_DEBUG", "Path clear BLOCKED: Too dark (brightness=${lastBrightness} < ${DARKNESS_BRIGHTNESS_THRESHOLD})")
@@ -837,7 +888,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             val now = System.currentTimeMillis()
             if (systemFailureCounter >= SYSTEM_FAILURE_THRESHOLD && now - lastSystemFailureWarning > SYSTEM_FAILURE_WARNING_COOLDOWN_MS) {
                 val warningMsg = "Warning: Navigation system may not be working properly. Please be extra careful and consider stopping."
-                speakGuidance(warningMsg, "system_failure")
+                speakGuidance(warningMsg, "system_failure", priority = 1) // High priority for safety
                 lastSystemFailureWarning = now
                 Log.w("SYSTEM_FAILURE", "System failure detected: depth failing=$depthFailing, detector failing=$detectorFailing, counter=$systemFailureCounter")
             }
@@ -860,7 +911,7 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
             val now = System.currentTimeMillis()
             if (darknessCounter >= DARKNESS_THRESHOLD && now - lastDarknessWarning > DARKNESS_WARNING_COOLDOWN_MS) {
                 val warningMsg = "Warning: Environment is too dark for safe navigation. Please stop and find better lighting or assistance."
-                speakGuidance(warningMsg, "darkness")
+                speakGuidance(warningMsg, "darkness", priority = 1) // High priority for safety
                 lastDarknessWarning = now
                 Log.w("DARKNESS_WARNING", "Dark environment detected: brightness=$brightness, threshold=$DARKNESS_BRIGHTNESS_THRESHOLD")
             }
@@ -1150,15 +1201,22 @@ class MainActivity : AppCompatActivity(), Detector.DetectorListener {
         lastWallScore = bestScore
         lastWallMeters = smoothedDistance
         
+        Log.d("WALL_DEBUG", "=== WALL STATE UPDATED ===")
+        Log.d("WALL_DEBUG", "wallDetected=$wallDetected, lastWallMeters=$lastWallMeters, threshold=$WALL_WARNING_DISTANCE_THRESHOLD")
+        
         // TTS if a smoothed wall is detected AND it's close enough to warn about
         val now = System.currentTimeMillis()
-        if (wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD && now - lastWallSpokenTime > WALL_SPEECH_COOLDOWN_MS) {
+        val shouldSpeak = wallDetected && lastWallMeters != null && lastWallMeters!! < WALL_WARNING_DISTANCE_THRESHOLD && now - lastWallSpokenTime > WALL_SPEECH_COOLDOWN_MS
+        Log.d("WALL_DEBUG", "Wall speech check: shouldSpeak=$shouldSpeak, wallDetected=$wallDetected, meters=$lastWallMeters, cooldown=${now - lastWallSpokenTime}ms > ${WALL_SPEECH_COOLDOWN_MS}ms")
+        
+        if (shouldSpeak) {
             val distancePart = if (lastWallMeters!! in 0.5f..5.0f) String.format("%.1f meters", lastWallMeters!!) else ""
             val msg = if (distancePart.isNotEmpty()) {
                 "Wall ahead $distancePart, be careful, feel what's in front of you and stop"
             } else {
                 "Wall ahead, be careful, feel what's in front of you and stop"
             }
+            Log.d("WALL_DEBUG", "Speaking wall warning: $msg")
             speakGuidance(msg, "wall")
             lastWallSpokenTime = now
         }

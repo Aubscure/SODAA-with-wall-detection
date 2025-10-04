@@ -1,3 +1,7 @@
+Chair
+Door
 Person
+Stair
+Table
 Vehicle
 objects
